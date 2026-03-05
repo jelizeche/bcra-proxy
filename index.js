@@ -1,9 +1,28 @@
 /**
+ * bcra-proxy (Render-ready)
  * Small, Action-friendly metrics endpoint (prevents ResponseTooLargeError)
  * Example:
  *  /bcra/metrics/reservas?months=12
  *  /bcra/metrics/policy_rate?months=12
  */
+
+import express from "express";
+
+// Opcional: si querés soporte .env en local.
+// En Render NO hace falta si configurás env vars en el dashboard.
+// import dotenv from "dotenv";
+// dotenv.config();
+
+const app = express();
+app.use(express.json());
+
+const BCRA_TOKEN = process.env.BCRA_TOKEN;
+
+// Healthcheck (Render suele pegarle a /)
+app.get("/", (_req, res) => {
+  res.status(200).json({ ok: true, service: "bcra-proxy" });
+});
+
 app.get("/bcra/metrics/:serie", async (req, res) => {
   try {
     let { serie } = req.params;
@@ -15,14 +34,14 @@ app.get("/bcra/metrics/:serie", async (req, res) => {
     if (!Number.isFinite(months) || months <= 0) {
       return res.status(400).json({
         error: "Invalid 'months'. Expected positive number.",
-        example: "/bcra/metrics/reservas?months=12"
+        example: "/bcra/metrics/reservas?months=12",
       });
     }
 
     // Aliases (same as /bcra/series)
     const ALIASES = {
       policy_rate: "leliq",
-      badlar: "tasa_badlar"
+      badlar: "tasa_badlar",
     };
     const resolved = ALIASES[serie] || serie;
 
@@ -33,7 +52,7 @@ app.get("/bcra/metrics/:serie", async (req, res) => {
     // Fetch full upstream series (server-side; NOT sent to GPT)
     const url = `https://api.estadisticasbcra.com/${encodeURIComponent(resolved)}`;
     const r = await fetch(url, {
-      headers: { Authorization: `Bearer ${BCRA_TOKEN}` }
+      headers: { Authorization: `Bearer ${BCRA_TOKEN}` },
     });
 
     if (!r.ok) {
@@ -42,7 +61,7 @@ app.get("/bcra/metrics/:serie", async (req, res) => {
         error: "BCRA API error",
         serie_requested: serie,
         serie_resolved: resolved,
-        detail: text
+        detail: text,
       });
     }
 
@@ -82,16 +101,22 @@ app.get("/bcra/metrics/:serie", async (req, res) => {
     const changeAbs = latest.v - closest.v;
     const changePct = closest.v === 0 ? null : changeAbs / closest.v;
 
-    res.json({
+    return res.json({
       serie,
       resolved,
       window: { months },
       latest: { d: latest.d, v: latest.v },
       past: { d: closest.d, v: closest.v },
       change_abs: changeAbs,
-      change_pct: changePct
+      change_pct: changePct,
     });
   } catch (e) {
-    res.status(500).json({ error: "Unexpected error", detail: String(e) });
+    return res.status(500).json({ error: "Unexpected error", detail: String(e) });
   }
+});
+
+// Render: usar PORT provisto
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`Listening on ${PORT}`);
 });
