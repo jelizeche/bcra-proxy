@@ -9,10 +9,11 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 const BCRA_TOKEN = process.env.BCRA_TOKEN;
 
+app.get("/health", (req, res) => res.json({ ok: true }));
+
 /**
- * Discover which candidate series names exist upstream (api.estadisticasbcra.com)
- * Example:
- *  /bcra/discover?candidates=leliq,tasa_leliq,tasa_badlar
+ * Discover which candidate series names exist upstream.
+ * Example: /bcra/discover?candidates=leliq,tasa_leliq,tasa_badlar,reservas,uva
  */
 app.get("/bcra/discover", async (req, res) => {
   try {
@@ -28,8 +29,7 @@ app.get("/bcra/discover", async (req, res) => {
     if (candidates.length === 0) {
       return res.status(400).json({
         error: "Missing candidates",
-        example:
-          "/bcra/discover?candidates=leliq,reservas,uva,tasa_badlar,tasa_leliq",
+        example: "/bcra/discover?candidates=leliq,reservas,uva,tasa_badlar"
       });
     }
 
@@ -37,7 +37,7 @@ app.get("/bcra/discover", async (req, res) => {
     for (const name of candidates) {
       const url = `https://api.estadisticasbcra.com/${encodeURIComponent(name)}`;
       const r = await fetch(url, {
-        headers: { Authorization: `Bearer ${BCRA_TOKEN}` },
+        headers: { Authorization: `Bearer ${BCRA_TOKEN}` }
       });
       results.push({ name, ok: r.ok, status: r.status });
     }
@@ -48,29 +48,25 @@ app.get("/bcra/discover", async (req, res) => {
   }
 });
 
-app.get("/health", (req, res) => res.json({ ok: true }));
-
 /**
- * Get a BCRA time series by name (supports aliases)
+ * Get a BCRA time series by name or alias.
+ * Supports query params to avoid huge payloads:
+ *  - last: integer, returns only last N points
+ *  - since: YYYY-MM-DD, returns only points with d >= since
+ *
  * Examples:
- *  /bcra/series/reservas
- *  /bcra/series/uva
- *  /bcra/series/policy_rate  -> leliq
- *  /bcra/series/badlar       -> tasa_badlar
+ *  /bcra/series/reservas?last=400
+ *  /bcra/series/reservas?since=2024-01-01
+ *  /bcra/series/policy_rate?last=60
  */
 app.get("/bcra/series/:serie", async (req, res) => {
   try {
     let { serie } = req.params;
-
-    // 1) sanitize
     serie = String(serie).trim();
 
-    // 2) stable aliases (so GPT never has to guess upstream names)
     const ALIASES = {
-      policy_rate: "leliq",     // ✅ "tasa de política" proxy
-      badlar: "tasa_badlar",    // ✅ BADLAR proxy (exists in your discover)
-      leliq: "leliq",           // optional: explicit
-      tasa_leliq: "tasa_leliq", // optional: explicit
+      policy_rate: "leliq",
+      badlar: "tasa_badlar"
     };
 
     const resolved = ALIASES[serie] || serie;
@@ -81,7 +77,7 @@ app.get("/bcra/series/:serie", async (req, res) => {
 
     const url = `https://api.estadisticasbcra.com/${encodeURIComponent(resolved)}`;
     const r = await fetch(url, {
-      headers: { Authorization: `Bearer ${BCRA_TOKEN}` },
+      headers: { Authorization: `Bearer ${BCRA_TOKEN}` }
     });
 
     if (!r.ok) {
@@ -90,12 +86,51 @@ app.get("/bcra/series/:serie", async (req, res) => {
         error: "BCRA API error",
         serie_requested: serie,
         serie_resolved: resolved,
-        detail: text,
+        detail: text
       });
     }
 
-    const data = await r.json();
-    res.json({ serie: serie, resolved, data });
+    let data = await r.json();
+
+    // Expecting array of points like: [{ d: "YYYY-MM-DD", v: number }, ...]
+    if (!Array.isArray(data)) {
+      // If upstream changes format, still return something useful.
+      return res.json({ serie, resolved, data });
+    }
+
+    // Apply "since" filter (YYYY-MM-DD)
+    const sinceRaw = req.query.since;
+    if (sinceRaw) {
+      const since = String(sinceRaw).trim();
+      // Basic validation for YYYY-MM-DD
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(since)) {
+        return res.status(400).json({
+          error: "Invalid 'since' format. Expected YYYY-MM-DD.",
+          example: "/bcra/series/reservas?since=2024-01-01"
+        });
+      }
+      data = data.filter((p) => p && typeof p.d === "string" && p.d >= since);
+    }
+
+    // Apply "last" limit
+    const lastRaw = req.query.last;
+    if (lastRaw !== undefined) {
+      const last = Number(lastRaw);
+      if (!Number.isFinite(last) || last <= 0 || !Number.isInteger(last)) {
+        return res.status(400).json({
+          error: "Invalid 'last'. Expected positive integer.",
+          example: "/bcra/series/reservas?last=400"
+        });
+      }
+      if (data.length > last) data = data.slice(-last);
+    }
+
+    res.json({
+      serie,
+      resolved,
+      count: data.length,
+      data
+    });
   } catch (e) {
     res.status(500).json({ error: "Unexpected error", detail: String(e) });
   }
