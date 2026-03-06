@@ -17,7 +17,28 @@ app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 10000;
-const BCRA_TOKEN = process.env.BCRA_TOKEN;
+const BCRA_TOKEN = async function fetchReservasFromOfficialBcra() {
+  // TODO: reemplazar por el endpoint oficial exacto de reservas
+  const url = "https://api.bcra.gob.ar/estadisticas/v4.0/Monetarias/1";
+
+  const r = await fetch(url);
+  if (!r.ok) {
+    const text = await r.text();
+    throw new Error(`Official BCRA API error: ${r.status} ${text}`);
+  }
+
+  const json = await r.json();
+
+  // Ajustar según estructura real de la API oficial
+  const results = json.results || json.Resultado || [];
+
+  return results
+    .map((x) => ({
+      d: x.fecha || x.Fecha,
+      v: Number(x.valor ?? x.Valor),
+    }))
+    .filter((x) => x.d && Number.isFinite(x.v));
+};
 
 // ---- helpers ----
 const ALIASES = {
