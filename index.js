@@ -1,30 +1,86 @@
-app.get("/bcra/metrics/:serie", async (req, res) => {
-  try {
-    let { serie } = req.params;
-    serie = String(serie).trim();
+/**
+ * bcra-proxy (Render-ready)
+ * Endpoints:
+ *  - GET /            (health)
+ *  - GET /health      (health)
+ *  - GET /bcra/discover?candidates=a,b,c
+ *  - GET /bcra/series/:serie?last=120&since=YYYY-MM-DD
+ *  - GET /bcra/metrics/:serie?months=12
+ */
 
-    const monthsRaw = req.query.months ?? "12";
-    const months = Number(monthsRaw);
-    if (!Number.isFinite(months) || months <= 0) {
+import express from "express";
+import fetch from "node-fetch";
+import cors from "cors";
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+const PORT = process.env.PORT || 10000;
+const BCRA_TOKEN = process.env.BCRA_TOKEN;
+
+// ---- helpers ----
+const ALIASES = {
+  policy_rate: "leliq",
+  badlar: "tasa_badlar",
+};
+
+function requireToken(res) {
+  if (!BCRA_TOKEN) {
+    res.status(500).json({ error: "Missing BCRA_TOKEN env var" });
+    return false;
+  }
+  return true;
+}
+
+// ---- health ----
+app.get("/", (_req, res) => res.status(200).json({ ok: true, service: "bcra-proxy" }));
+app.get("/health", (_req, res) => res.status(200).json({ ok: true }));
+
+// ---- discover ----
+app.get("/bcra/discover", async (req, res) => {
+  try {
+    if (!requireToken(res)) return;
+
+    const candidates = String(req.query.candidates || "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+    if (candidates.length === 0) {
       return res.status(400).json({
-        error: "Invalid 'months'. Expected positive number.",
-        example: "/bcra/metrics/reservas?months=12"
+        error: "Missing candidates",
+        example: "/bcra/discover?candidates=leliq,reservas,uva,tasa_badlar",
       });
     }
 
-    const ALIASES = {
-      policy_rate: "leliq",
-      badlar: "tasa_badlar"
-    };
-    const resolved = ALIASES[serie] || serie;
-
-    if (!BCRA_TOKEN) {
-      return res.status(500).json({ error: "Missing BCRA_TOKEN env var" });
+    const results = [];
+    for (const name of candidates) {
+      const url = `https://api.estadisticasbcra.com/${encodeURIComponent(name)}`;
+      const r = await fetch(url, {
+        headers: { Authorization: `Bearer ${BCRA_TOKEN}` },
+      });
+      results.push({ name, ok: r.ok, status: r.status });
     }
+
+    return res.json({ results });
+  } catch (e) {
+    return res.status(500).json({ error: "Unexpected error", detail: String(e) });
+  }
+});
+
+// ---- series (filtered to avoid huge payloads) ----
+app.get("/bcra/series/:serie", async (req, res) => {
+  try {
+    if (!requireToken(res)) return;
+
+    let { serie } = req.params;
+    serie = String(serie).trim();
+    const resolved = ALIASES[serie] || serie;
 
     const url = `https://api.estadisticasbcra.com/${encodeURIComponent(resolved)}`;
     const r = await fetch(url, {
-      headers: { Authorization: `Bearer ${BCRA_TOKEN}` }
+      headers: { Authorization: `Bearer ${BCRA_TOKEN}` },
     });
 
     if (!r.ok) {
@@ -33,7 +89,78 @@ app.get("/bcra/metrics/:serie", async (req, res) => {
         error: "BCRA API error",
         serie_requested: serie,
         serie_resolved: resolved,
-        detail: text
+        detail: text,
+      });
+    }
+
+    let data = await r.json();
+
+    if (!Array.isArray(data)) {
+      return res.json({ serie, resolved, data });
+    }
+
+    // since=YYYY-MM-DD
+    const sinceRaw = req.query.since;
+    if (sinceRaw) {
+      const since = String(sinceRaw).trim();
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(since)) {
+        return res.status(400).json({
+          error: "Invalid 'since' format. Expected YYYY-MM-DD.",
+          example: "/bcra/series/reservas?since=2024-01-01",
+        });
+      }
+      data = data.filter((p) => p && typeof p.d === "string" && p.d >= since);
+    }
+
+    // last=N
+    const lastRaw = req.query.last;
+    if (lastRaw !== undefined) {
+      const last = Number(lastRaw);
+      if (!Number.isFinite(last) || last <= 0 || !Number.isInteger(last)) {
+        return res.status(400).json({
+          error: "Invalid 'last'. Expected positive integer.",
+          example: "/bcra/series/reservas?last=120",
+        });
+      }
+      if (data.length > last) data = data.slice(-last);
+    }
+
+    return res.json({ serie, resolved, count: data.length, data });
+  } catch (e) {
+    return res.status(500).json({ error: "Unexpected error", detail: String(e) });
+  }
+});
+
+// ---- metrics (compact; avoids ResponseTooLargeError) ----
+app.get("/bcra/metrics/:serie", async (req, res) => {
+  try {
+    if (!requireToken(res)) return;
+
+    let { serie } = req.params;
+    serie = String(serie).trim();
+    const resolved = ALIASES[serie] || serie;
+
+    const monthsRaw = req.query.months ?? "12";
+    const months = Number(monthsRaw);
+    if (!Number.isFinite(months) || months <= 0) {
+      return res.status(400).json({
+        error: "Invalid 'months'. Expected positive number.",
+        example: "/bcra/metrics/reservas?months=12",
+      });
+    }
+
+    const url = `https://api.estadisticasbcra.com/${encodeURIComponent(resolved)}`;
+    const r = await fetch(url, {
+      headers: { Authorization: `Bearer ${BCRA_TOKEN}` },
+    });
+
+    if (!r.ok) {
+      const text = await r.text();
+      return res.status(r.status).json({
+        error: "BCRA API error",
+        serie_requested: serie,
+        serie_resolved: resolved,
+        detail: text,
       });
     }
 
@@ -70,16 +197,18 @@ app.get("/bcra/metrics/:serie", async (req, res) => {
     const changeAbs = latest.v - closest.v;
     const changePct = closest.v === 0 ? null : changeAbs / closest.v;
 
-    res.json({
+    return res.json({
       serie,
       resolved,
       window: { months },
       latest: { d: latest.d, v: latest.v },
       past: { d: closest.d, v: closest.v },
       change_abs: changeAbs,
-      change_pct: changePct
+      change_pct: changePct,
     });
   } catch (e) {
-    res.status(500).json({ error: "Unexpected error", detail: String(e) });
+    return res.status(500).json({ error: "Unexpected error", detail: String(e) });
   }
 });
+
+app.listen(PORT, "0.0.0.0", () => console.log(`Listening on ${PORT}`));
